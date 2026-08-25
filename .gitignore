@@ -1,0 +1,41 @@
+# --- Large model artifacts (NEVER commit; hosted separately) ---
+models/
+*.safetensors
+*.bin
+*.pt
+*.onnx
+checkpoint-*/
+
+# --- Archives / downloads ---
+*.zip
+zip.zip
+
+# --- Datasets (kept out of the repo) ---
+*.csv
+!sample_reviews.csv
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Streamlit ---
+.streamlit/secrets.toml
