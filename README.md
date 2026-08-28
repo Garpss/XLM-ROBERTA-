@@ -15,6 +15,7 @@ The project ships as an interactive **Streamlit** application with four workspac
 - [How It Works (Pipeline)](#how-it-works-pipeline)
 - [Methodology & Formulas](#methodology--formulas)
 - [Project Structure](#project-structure)
+- [Training on Colab](#training-on-colab)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [The Fine-Tuned Model (required)](#the-fine-tuned-model-required)
@@ -92,12 +93,15 @@ The proposed BWS ranking is compared against a **Raw Sentiment Average (RSA)** b
 
 ```
 thesis/
-├── app.py              # Streamlit UI: overview, single review, batch & recommendations, evaluation
-├── model.py            # Model service + all data logic (inference, aggregation, BWS, ranking, metrics)
-├── requirements.txt    # Pinned dependencies
-├── README.md           # This file
-├── .gitignore          # Excludes large models, archives, datasets, caches
-└── models/             # (NOT committed) place the fine-tuned checkpoint here
+├── app.py                 # Streamlit UI: overview, single review, batch & recommendations, evaluation
+├── model.py               # Model service + all data logic (inference, aggregation, BWS, ranking, metrics)
+├── text_format.py         # Shared review cleaning + "Star rating: N out of 5." prefix
+├── pipeline.ipynb         # Colab training notebook (transformers 4.x and 5.x)
+├── pipeline_helpers.py    # TrainingArguments / Trainer kwargs compatible with HF v4 and v5
+├── requirements.txt       # Pinned dependencies
+├── README.md              # This file
+├── .gitignore             # Excludes large models, archives, datasets, caches
+└── models/                # (NOT committed) place the fine-tuned checkpoint here
     └── xlmr_sentiment_model/
         ├── config.json
         ├── model.safetensors        # or pytorch_model.bin
@@ -122,6 +126,24 @@ thesis/
 | `rank_products()` / `raw_sentiment_average_rank()` | BWS ranking and RSA baseline. |
 | `evaluate_ranking()` | Precision@K and NDCG@K for a chosen score column. |
 | `parse_project_metadata()` / `resolve_model_source()` | Metadata + model-path resolution. |
+
+---
+
+## Training on Colab
+
+Use `pipeline.ipynb` with a **GPU (T4)** runtime. The notebook is written for both Hugging Face transformers **4.x and 5.x**.
+
+Colab currently installs transformers 5, which **removed** `warmup_ratio` and `evaluation_strategy`. If you see:
+
+```
+TypeError: TrainingArguments.__init__() got an unexpected keyword argument 'warmup_ratio'
+```
+
+you do **not** need to re-download `xlm-roberta-base`. Re-run the **Helper functions** cell, then **Train**. On v5 the helper passes `warmup_steps=0.10` (a float in `[0, 1)` means 10% of total steps) and `eval_strategy="epoch"`.
+
+The `UNEXPECTED` / `MISSING` load report (`lm_head` vs `classifier`) is normal: the base checkpoint is a masked language model; the 3-class head is new and gets trained.
+
+After training, copy `models/xlmr_sentiment_model/` next to `app.py`. Inference uses the same text format as training (`Star rating: N out of 5.\nReview: ...`) whenever a rating column is present.
 
 ---
 
@@ -268,6 +290,8 @@ Toggle **Pick from dataset** to select a real review (filter by product, browse,
 | Every product shows review count = 1 | Wrong "group by" column (a per-row ID). Join the catalog and group by **Product Name**. |
 | Predictions all one class / all "0" | The generic base model loaded instead of the fine-tuned one — the label schema check will flag this. |
 | `streamlit: command not found` | Use `python -m streamlit run app.py`. |
+| Colab: `unexpected keyword argument 'warmup_ratio'` | Transformers 5 removed that argument. Re-run the **Helper functions** cell in `pipeline.ipynb`, then Train. Do not pin `transformers<5` after the model has already downloaded. |
+| Colab: `UNEXPECTED` keys on `xlm-roberta-base` | Ignore. The MLM head is unused; the classifier head is randomly initialized until you train. |
 
 ---
 

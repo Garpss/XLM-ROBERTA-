@@ -19,6 +19,8 @@ from sklearn.metrics import (
 )
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+from text_format import build_model_text, guess_rating_column
+
 
 ID2LABEL: Dict[int, str] = {0: "negative", 1: "neutral", 2: "positive"}
 LABEL2ID: Dict[str, int] = {label: idx for idx, label in ID2LABEL.items()}
@@ -28,7 +30,7 @@ LABEL_COLORS: Dict[str, str] = {
     "neutral": "#95A5A6",
     "positive": "#2ECC71",
 }
-MAX_MODEL_LENGTH = 256  # Matches the notebook's MAX_LENGTH.
+MAX_MODEL_LENGTH = 192  # Matches the Colab notebook MAX_LENGTH.
 MAX_INPUT_CHARS = 10_000
 DEFAULT_BATCH_SIZE = 16
 
@@ -335,7 +337,7 @@ class SentimentModelService:
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
         return probs
 
-    def predict(self, text: str) -> SentimentPrediction:
+    def predict(self, text: str, rating=None) -> SentimentPrediction:
         if not text or not text.strip():
             raise ValueError("Input text is empty.")
 
@@ -358,7 +360,8 @@ class SentimentModelService:
                 "samples (English/Tagalog). Prediction confidence may be less reliable."
             )
 
-        probs = self._forward_probabilities([clean_text])[0].tolist()
+        model_text = build_model_text(clean_text, rating)
+        probs = self._forward_probabilities([model_text])[0].tolist()
         if not probs:
             raise RuntimeError("Model produced no output probabilities.")
 
@@ -398,13 +401,25 @@ class SentimentModelService:
         )
 
     def predict_labels(
-        self, texts: Sequence[str], batch_size: int = DEFAULT_BATCH_SIZE
+        self,
+        texts: Sequence[str],
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        ratings: Optional[Sequence] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return predicted label ids and full probability matrix for a batch."""
         all_probs: List[np.ndarray] = []
+        rating_list: Sequence = ratings if ratings is not None else [None] * len(texts)
         for start in range(0, len(texts), batch_size):
-            chunk = [str(t) if t is not None else "" for t in texts[start : start + batch_size]]
-            chunk = [t if t.strip() else " " for t in chunk]
+            raw_chunk = [
+                str(t) if t is not None else "" for t in texts[start : start + batch_size]
+            ]
+            rate_chunk = list(rating_list[start : start + batch_size])
+            while len(rate_chunk) < len(raw_chunk):
+                rate_chunk.append(None)
+            chunk = [
+                build_model_text(t if t.strip() else " ", r)
+                for t, r in zip(raw_chunk, rate_chunk)
+            ]
             all_probs.append(self._forward_probabilities(chunk))
         if not all_probs:
             return np.array([]), np.zeros((0, len(self.runtime_id2label)))
@@ -417,11 +432,18 @@ class SentimentModelService:
         df: pd.DataFrame,
         text_col: str,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        rating_col: Optional[str] = None,
     ) -> pd.DataFrame:
         """Append sentiment_label, sentiment_score, confidence_level to reviews."""
         working = df.copy()
         texts = working[text_col].fillna("").astype(str).tolist()
-        pred_ids, prob_matrix = self.predict_labels(texts, batch_size=batch_size)
+        resolved_rating_col = rating_col or guess_rating_column(working.columns)
+        ratings = (
+            working[resolved_rating_col].tolist() if resolved_rating_col else None
+        )
+        pred_ids, prob_matrix = self.predict_labels(
+            texts, batch_size=batch_size, ratings=ratings
+        )
 
         positive_idx = self._positive_index()
         working["sentiment_label"] = [
@@ -436,8 +458,11 @@ class SentimentModelService:
         texts: Sequence[str],
         true_labels: Sequence,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        ratings: Optional[Sequence] = None,
     ) -> Dict[str, object]:
-        pred_ids, _ = self.predict_labels(texts, batch_size=batch_size)
+        pred_ids, _ = self.predict_labels(
+            texts, batch_size=batch_size, ratings=ratings
+        )
         y_true = np.array([_coerce_label_id(v) for v in true_labels])
         y_pred = np.array([int(v) for v in pred_ids])
 

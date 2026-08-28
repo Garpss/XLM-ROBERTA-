@@ -364,6 +364,9 @@ def _render_single_review(service: SentimentModelService, schema_ok: bool) -> No
 
         default_text = str(subset["review"].iloc[idx])
         st.caption(f"Product: **{subset['product'].iloc[idx]}**")
+        picked_rating = subset["rating"].iloc[idx] if "rating" in subset.columns else None
+    else:
+        picked_rating = None
 
     input_text = st.text_area(
         "Review text",
@@ -372,12 +375,28 @@ def _render_single_review(service: SentimentModelService, schema_ok: bool) -> No
         placeholder="Paste an English, Filipino, or Taglish (Filipino-English) review here...",
     )
 
+    rating_value = None
+    try:
+        if picked_rating is not None and not pd.isna(picked_rating):
+            rating_value = int(float(picked_rating))
+    except (TypeError, ValueError):
+        rating_value = None
+
+    rating_value = st.number_input(
+        "Star rating (optional, 1–5). Used when the checkpoint was trained with rating context.",
+        min_value=0,
+        max_value=5,
+        value=int(rating_value) if rating_value else 0,
+        help="0 = omit rating. Match the Colab format: 'Star rating: N out of 5.'",
+    )
+    rating_arg = rating_value if rating_value else None
+
     if st.button("Run Analysis", type="primary", disabled=not schema_ok):
         if not input_text or not input_text.strip():
             st.warning("Please provide non-empty text before running analysis.")
             return
 
-        prediction = service.predict(input_text)
+        prediction = service.predict(input_text, rating=rating_arg)
         for warning in prediction.warnings:
             st.warning(warning)
 
@@ -424,6 +443,7 @@ def _build_sample_dataframe() -> pd.DataFrame:
                 "Good value for money overall.",
                 "Hindi maganda, madaling masira.",
             ],
+            "Rating Star": [5, 5, 3, 4, 1],
         }
     )
 
@@ -569,12 +589,14 @@ def _render_batch(service: SentimentModelService, schema_ok: bool) -> None:
     category_col = None if category_choice == "(none)" else category_choice
 
     if product_col in df.columns and review_col in df.columns:
-        st.session_state.review_pool = pd.DataFrame(
-            {
-                "product": df[product_col].astype(str),
-                "review": df[review_col].astype(str),
-            }
-        )
+        rating_col = _guess_column(cols, "Rating Star", "rating", "stars", "star")
+        pool_data = {
+            "product": df[product_col].astype(str),
+            "review": df[review_col].astype(str),
+        }
+        if rating_col:
+            pool_data["rating"] = df[rating_col]
+        st.session_state.review_pool = pd.DataFrame(pool_data)
 
     n_rows = len(df)
     n_groups = df[product_col].nunique(dropna=True)
@@ -728,9 +750,16 @@ def _render_evaluation(service: SentimentModelService, schema_ok: bool) -> None:
             if st.button("Run Classification Evaluation", type="primary", disabled=not schema_ok):
                 with st.spinner("Evaluating on labeled data..."):
                     try:
+                        rating_col = _guess_column(
+                            cols, "Rating Star", "rating", "stars", "star"
+                        )
+                        ratings = (
+                            eval_df[rating_col].tolist() if rating_col else None
+                        )
                         result = service.evaluate_classification(
                             eval_df[text_col].fillna("").astype(str).tolist(),
                             eval_df[label_col].tolist(),
+                            ratings=ratings,
                         )
                     except ValueError as exc:
                         st.error(str(exc))
