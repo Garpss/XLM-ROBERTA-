@@ -348,6 +348,7 @@ def _render_single_review(service: SentimentModelService, schema_ok: bool) -> No
         st.caption("Tip: load a reviews CSV in the **Batch & Recommendations** tab to pick real reviews here.")
 
     default_text = ""
+    picked_rating = None
     if source == "Pick from dataset" and has_pool:
         products = ["(all products)"] + sorted(pool["product"].dropna().unique().tolist())
         f1, f2 = st.columns([3, 1])
@@ -373,6 +374,7 @@ def _render_single_review(service: SentimentModelService, schema_ok: bool) -> No
         st.session_state.picked_review_idx = idx
 
         default_text = str(subset["review"].iloc[idx])
+        picked_rating = subset["rating"].iloc[idx] if "rating" in subset.columns else None
         st.caption(f"Product: **{subset['product'].iloc[idx]}**")
         picked_rating = subset["rating"].iloc[idx] if "rating" in subset.columns else None
     else:
@@ -605,6 +607,7 @@ def _render_batch(service: SentimentModelService, schema_ok: bool) -> None:
             "Category column (optional)", category_options, index=_index_of(category_options, default_category_col)
         )
     category_col = None if category_choice == "(none)" else category_choice
+    rating_col = "Rating Star" if "Rating Star" in df.columns else None
 
     if product_col in df.columns and review_col in df.columns:
         rating_col = _guess_column(cols, "Rating Star", "rating", "stars", "star")

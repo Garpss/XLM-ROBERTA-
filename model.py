@@ -441,7 +441,8 @@ class SentimentModelService:
         if not text or not text.strip():
             raise ValueError("Input text is empty.")
 
-        clean_text = text.strip()
+        original = text.strip()
+        clean_text = build_model_text(original, rating=rating)
         warnings: List[str] = []
         truncated = False
 
@@ -452,7 +453,7 @@ class SentimentModelService:
                 f"Input exceeded {MAX_INPUT_CHARS:,} characters and was truncated."
             )
 
-        language_code, language_name = self._detect_language(clean_text)
+        language_code, language_name = self._detect_language(original)
         supported = language_code in PROJECT_LANGUAGE_CODES
         if not supported and language_code != "unknown":
             warnings.append(
