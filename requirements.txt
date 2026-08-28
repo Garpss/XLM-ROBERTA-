@@ -6,4 +6,5 @@ torch==2.13.0
 transformers==4.57.6
 scikit-learn==1.7.0
 sentencepiece==0.2.2
+joblib==1.5.3
 langdetect==1.0.9

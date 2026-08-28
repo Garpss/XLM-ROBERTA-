@@ -15,6 +15,7 @@ The project ships as an interactive **Streamlit** application with four workspac
 - [How It Works (Pipeline)](#how-it-works-pipeline)
 - [Methodology & Formulas](#methodology--formulas)
 - [Project Structure](#project-structure)
+- [Training on Colab](#training-on-colab)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [The Fine-Tuned Model (required)](#the-fine-tuned-model-required)
@@ -92,12 +93,20 @@ The proposed BWS ranking is compared against a **Raw Sentiment Average (RSA)** b
 
 ```
 thesis/
-├── app.py              # Streamlit UI: overview, single review, batch & recommendations, evaluation
-├── model.py            # Model service + all data logic (inference, aggregation, BWS, ranking, metrics)
-├── requirements.txt    # Pinned dependencies
-├── README.md           # This file
-├── .gitignore          # Excludes large models, archives, datasets, caches
-└── models/             # (NOT committed) place the fine-tuned checkpoint here
+├── app.py                 # Streamlit UI: overview, single review, batch & recommendations, evaluation
+├── model.py               # Model service + all data logic (inference, aggregation, BWS, ranking, metrics)
+├── text_format.py         # Shared review cleaning + "Star rating: N out of 5." prefix
+├── pipeline.ipynb         # Colab XLM-R training notebook (transformers 4.x and 5.x)
+├── pipeline_helpers.py    # TrainingArguments / Trainer kwargs compatible with HF v4 and v5
+├── hybrid_model/          # Committed compact FiReCS classifier + held-out metrics
+│   ├── pipeline.joblib
+│   └── metrics.json
+├── train_hybrid.py        # Retrain the hybrid model from ccosme/FiReCS
+├── rating_fusion.py       # Shopee star-rating prior fused with text probabilities
+├── requirements.txt       # Pinned dependencies
+├── README.md              # This file
+├── .gitignore             # Excludes large models, archives, datasets, caches
+└── models/                # (NOT committed) place the fine-tuned checkpoint here
     └── xlmr_sentiment_model/
         ├── config.json
         ├── model.safetensors        # or pytorch_model.bin
@@ -107,7 +116,7 @@ thesis/
         └── sentencepiece.bpe.model
 ```
 
-> `models/`, `*.zip`, and `*.csv` are intentionally **git-ignored** — model weights are large (multiple GB) and datasets/archives are kept out of version control. Host the trained model on Google Drive / Hugging Face and download it locally.
+> `models/` (XLM-R weights), `*.zip`, and `*.csv` are intentionally **git-ignored**. The compact hybrid checkpoint in `hybrid_model/` **is** committed so Streamlit can run without a GPU download.
 
 ### Key modules in `model.py`
 
@@ -122,6 +131,43 @@ thesis/
 | `rank_products()` / `raw_sentiment_average_rank()` | BWS ranking and RSA baseline. |
 | `evaluate_ranking()` | Precision@K and NDCG@K for a chosen score column. |
 | `parse_project_metadata()` / `resolve_model_source()` | Metadata + model-path resolution. |
+
+---
+
+## Hybrid model (default in Streamlit)
+
+The app ships with a compact **FiReCS hybrid** so predictions work without a 1 GB GPU checkpoint:
+
+1. Word + character TF-IDF logistic regression trained on **10,487** official FiReCS reviews (Taglish Shopee + Google Maps).
+2. **Star-rating fusion** using the empirical P(label | ★) from the 1,000-row Shopee annotation table.
+
+Held-out FiReCS test (3,147 reviews):
+
+| Model | Accuracy | Weighted F1 |
+| --- | --- | --- |
+| Previous Shopee 1k XLM-R | 0.770 | 0.765 |
+| Hybrid text only | 0.816 | 0.817 |
+| Hybrid + star-rating fusion | **0.868** | **0.867** |
+
+Retrain with `python train_hybrid.py` after downloading `ccosme/FiReCS`. A later Colab XLM-R checkpoint in `models/xlmr_sentiment_model/` is still preferred when present.
+
+Open **Model Results** in Streamlit to see the confusion matrix, per-class F1, and live Taglish predictions.
+
+---
+
+Use `pipeline.ipynb` with a **GPU (T4)** runtime. The notebook is written for both Hugging Face transformers **4.x and 5.x**.
+
+Colab currently installs transformers 5, which **removed** `warmup_ratio` and `evaluation_strategy`. If you see:
+
+```
+TypeError: TrainingArguments.__init__() got an unexpected keyword argument 'warmup_ratio'
+```
+
+you do **not** need to re-download `xlm-roberta-base`. Re-run the **Helper functions** cell, then **Train**. On v5 the helper passes `warmup_steps=0.10` (a float in `[0, 1)` means 10% of total steps) and `eval_strategy="epoch"`.
+
+The `UNEXPECTED` / `MISSING` load report (`lm_head` vs `classifier`) is normal: the base checkpoint is a masked language model; the 3-class head is new and gets trained.
+
+After training, copy `models/xlmr_sentiment_model/` next to `app.py`. Inference uses the same text format as training (`Star rating: N out of 5.\nReview: ...`) whenever a rating column is present.
 
 ---
 
@@ -164,11 +210,9 @@ pip install -r requirements.txt
 
 ---
 
-## The Fine-Tuned Model (required)
+## The Fine-Tuned Model (optional XLM-R)
 
-The app needs the **fine-tuned** XLM-RoBERTa checkpoint. Without it, the app falls back to the generic `xlm-roberta-base` (which only has 2 generic labels), fails schema validation, and **disables all prediction buttons** on purpose.
-
-Place your trained model here:
+Streamlit loads `hybrid_model/` by default. To use a Colab-fine-tuned **XLM-RoBERTa** checkpoint instead, place it at:
 
 ```
 models/xlmr_sentiment_model/
@@ -268,6 +312,8 @@ Toggle **Pick from dataset** to select a real review (filter by product, browse,
 | Every product shows review count = 1 | Wrong "group by" column (a per-row ID). Join the catalog and group by **Product Name**. |
 | Predictions all one class / all "0" | The generic base model loaded instead of the fine-tuned one — the label schema check will flag this. |
 | `streamlit: command not found` | Use `python -m streamlit run app.py`. |
+| Colab: `unexpected keyword argument 'warmup_ratio'` | Transformers 5 removed that argument. Re-run the **Helper functions** cell in `pipeline.ipynb`, then Train. Do not pin `transformers<5` after the model has already downloaded. |
+| Colab: `UNEXPECTED` keys on `xlm-roberta-base` | Ignore. The MLM head is unused; the classifier head is randomly initialized until you train. |
 
 ---
 

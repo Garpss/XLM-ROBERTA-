@@ -9,7 +9,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
 from langdetect import LangDetectException, detect
 from sklearn.metrics import (
     accuracy_score,
@@ -17,7 +16,9 @@ from sklearn.metrics import (
     ndcg_score,
     precision_recall_fscore_support,
 )
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+from rating_fusion import DEFAULT_FUSION_ALPHA, fuse_with_rating
+from text_format import build_model_text, clean_review, guess_rating_column
 
 
 ID2LABEL: Dict[int, str] = {0: "negative", 1: "neutral", 2: "positive"}
@@ -28,9 +29,10 @@ LABEL_COLORS: Dict[str, str] = {
     "neutral": "#95A5A6",
     "positive": "#2ECC71",
 }
-MAX_MODEL_LENGTH = 256  # Matches the notebook's MAX_LENGTH.
+MAX_MODEL_LENGTH = 192  # Matches the Colab notebook MAX_LENGTH.
 MAX_INPUT_CHARS = 10_000
 DEFAULT_BATCH_SIZE = 16
+HYBRID_DIRNAME = "hybrid_model"
 
 
 @dataclass
@@ -41,9 +43,9 @@ class ModelMetadata:
     )
     project_description: str = (
         "A sentiment-aware recommender system for Filipino, English, and Taglish "
-        "(Filipino-English) e-commerce reviews. Fine-tuned XLM-RoBERTa classifies "
-        "review sentiment, then a Bayesian Weighted Score ranks products while "
-        "protecting against low-sample bias."
+        "(Filipino-English) e-commerce reviews. A FiReCS hybrid classifier "
+        "(optional fine-tuned XLM-RoBERTa) scores review sentiment, then a "
+        "Bayesian Weighted Score ranks products while protecting against low-sample bias."
     )
     authors: List[str] = field(
         default_factory=lambda: [
@@ -68,10 +70,10 @@ class ModelMetadata:
     language_support_note: str = ""
     model_runtime_note: str = ""
     dataset_note: str = (
-        "FiReCS (10,487 Filipino-English code-switched reviews) + Echemane "
-        "(1,001 Tagalog reviews). Split 70:15:15 (train:validation:test)."
+        "FiReCS (10,487 Filipino-English code-switched Shopee + Google Maps reviews). "
+        "Official split 7,340 train / 3,147 test, plus Shopee star-rating fusion."
     )
-    split_ratio: str = "70:15:15"
+    split_ratio: str = "FiReCS 7340/3147 train/test"
     metadata_fields: List[str] = field(
         default_factory=lambda: [
             "product_title",
@@ -104,6 +106,49 @@ LANGUAGE_NAME_BY_CODE = {
 # The notebook does not provide an explicit language list; these are grounded in
 # observed sample comments and project context.
 PROJECT_LANGUAGE_CODES = {"en", "tl", "fil"}
+
+
+def _hybrid_dir_candidates(explicit: Optional[str] = None) -> List[Path]:
+    paths: List[Path] = []
+    if explicit:
+        paths.append(Path(explicit))
+    here = Path(__file__).resolve().parent
+    paths.extend(
+        [
+            Path.cwd() / HYBRID_DIRNAME,
+            here / HYBRID_DIRNAME,
+        ]
+    )
+    return paths
+
+
+def is_hybrid_source(source: str) -> bool:
+    path = Path(source)
+    return (path / "pipeline.joblib").exists()
+
+
+def is_xlmr_checkpoint(source: str) -> bool:
+    config = Path(source) / "config.json"
+    if not config.exists():
+        return False
+    try:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    labels = payload.get("id2label") or {}
+    normalized = {_normalize_label(v) for v in labels.values()}
+    return {"negative", "neutral", "positive"} <= normalized
+
+
+def load_hybrid_metrics() -> dict:
+    for folder in _hybrid_dir_candidates():
+        metrics_file = folder / "metrics.json"
+        if metrics_file.exists():
+            try:
+                return json.loads(metrics_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+    return {}
 
 
 def _normalize_label(label: str) -> str:
@@ -158,6 +203,12 @@ def _candidate_notebook_paths(explicit_path: Optional[str] = None) -> List[Path]
 
 def parse_project_metadata(notebook_path: Optional[str] = None) -> ModelMetadata:
     metadata = ModelMetadata()
+    metadata.supported_languages = ["English", "Filipino", "Taglish (Filipino-English)"]
+    metadata.language_support_note = (
+        "Hybrid Taglish classifier (word+char TF-IDF logistic regression on FiReCS) "
+        "with Shopee star-rating fusion. Optional XLM-RoBERTa checkpoint is used when "
+        "a fine-tuned `xlmr_sentiment_model` folder is present."
+    )
 
     notebook_file: Optional[Path] = None
     notebook_text: Optional[str] = None
@@ -168,61 +219,68 @@ def parse_project_metadata(notebook_path: Optional[str] = None) -> ModelMetadata
             notebook_text = _read_notebook_text(candidate)
             break
 
-    if notebook_file is None or notebook_text is None:
-        metadata.supported_languages = ["English", "Filipino", "Taglish (Filipino-English)"]
-        metadata.language_support_note = (
-            "Multilingual XLM-RoBERTa backbone supporting English, Filipino, and "
-            "Taglish (Filipino-English code-switched) e-commerce reviews. "
-            "Notebook metadata unavailable, so training stats are hidden."
+    if notebook_file is not None and notebook_text is not None:
+        metadata.notebook_path = str(notebook_file)
+        metadata.model_name = (
+            _search_str(r'MODEL_NAME\s*=\s*"([^"]+)"', notebook_text) or metadata.model_name
         )
-        return metadata
+        parsed_num_labels = _search_int(r"NUM_LABELS\s*=\s*(\d+)", notebook_text)
+        if parsed_num_labels:
+            metadata.num_labels = parsed_num_labels
 
-    metadata.notebook_path = str(notebook_file)
-    metadata.model_name = (
-        _search_str(r'MODEL_NAME\s*=\s*"([^"]+)"', notebook_text) or metadata.model_name
-    )
-    parsed_num_labels = _search_int(r"NUM_LABELS\s*=\s*(\d+)", notebook_text)
-    if parsed_num_labels:
-        metadata.num_labels = parsed_num_labels
+        metadata.labeled_rows = _search_int(r"Labeled rows\s*:\s*([\d,]+)", notebook_text)
+        metadata.train_rows = _search_int(r"Train:\s*([\d,]+)\s*\|\s*Val:", notebook_text)
+        metadata.val_rows = _search_int(
+            r"Train:\s*[\d,]+\s*\|\s*Val:\s*([\d,]+)", notebook_text
+        )
 
-    metadata.labeled_rows = _search_int(r"Labeled rows\s*:\s*([\d,]+)", notebook_text)
-    metadata.train_rows = _search_int(r"Train:\s*([\d,]+)\s*\|\s*Val:", notebook_text)
-    metadata.val_rows = _search_int(
-        r"Train:\s*[\d,]+\s*\|\s*Val:\s*([\d,]+)", notebook_text
-    )
+        class_neg = _search_int(r"NEGATIVE\s*\(label=0\)\s*—\s*([\d,]+)\s*rows", notebook_text)
+        class_neu = _search_int(r"NEUTRAL\s*\(label=1\)\s*—\s*([\d,]+)\s*rows", notebook_text)
+        class_pos = _search_int(r"POSITIVE\s*\(label=2\)\s*—\s*([\d,]+)\s*rows", notebook_text)
+        if class_neg is not None:
+            metadata.class_distribution["negative"] = class_neg
+        if class_neu is not None:
+            metadata.class_distribution["neutral"] = class_neu
+        if class_pos is not None:
+            metadata.class_distribution["positive"] = class_pos
 
-    class_neg = _search_int(r"NEGATIVE\s*\(label=0\)\s*—\s*([\d,]+)\s*rows", notebook_text)
-    class_neu = _search_int(r"NEUTRAL\s*\(label=1\)\s*—\s*([\d,]+)\s*rows", notebook_text)
-    class_pos = _search_int(r"POSITIVE\s*\(label=2\)\s*—\s*([\d,]+)\s*rows", notebook_text)
-    if class_neg is not None:
-        metadata.class_distribution["negative"] = class_neg
-    if class_neu is not None:
-        metadata.class_distribution["neutral"] = class_neu
-    if class_pos is not None:
-        metadata.class_distribution["positive"] = class_pos
+        for metric in ["accuracy", "precision", "recall", "f1"]:
+            value = _search_float(rf"eval_{metric}:\s*([0-9]+\.[0-9]+)", notebook_text)
+            if value is not None:
+                metadata.eval_metrics[metric] = value
 
-    for metric in ["accuracy", "precision", "recall", "f1"]:
-        value = _search_float(rf"eval_{metric}:\s*([0-9]+\.[0-9]+)", notebook_text)
-        if value is not None:
-            metadata.eval_metrics[metric] = value
+        epochs = _search_int(r"EPOCHS\s*=\s*(\d+)", notebook_text)
+        batch_size = _search_int(r"BATCH_SIZE\s*=\s*(\d+)", notebook_text)
+        learning_rate = _search_str(r"LR\s*=\s*([0-9eE\-\.+]+)", notebook_text)
+        if epochs is not None:
+            metadata.training_hyperparameters["epochs"] = str(epochs)
+        if batch_size is not None:
+            metadata.training_hyperparameters["batch_size"] = str(batch_size)
+        if learning_rate:
+            metadata.training_hyperparameters["learning_rate"] = learning_rate
+        metadata.training_hyperparameters["max_length"] = str(MAX_MODEL_LENGTH)
 
-    epochs = _search_int(r"EPOCHS\s*=\s*(\d+)", notebook_text)
-    batch_size = _search_int(r"BATCH_SIZE\s*=\s*(\d+)", notebook_text)
-    learning_rate = _search_str(r"LR\s*=\s*([0-9eE\-\.+]+)", notebook_text)
-    if epochs is not None:
-        metadata.training_hyperparameters["epochs"] = str(epochs)
-    if batch_size is not None:
-        metadata.training_hyperparameters["batch_size"] = str(batch_size)
-    if learning_rate:
-        metadata.training_hyperparameters["learning_rate"] = learning_rate
-    metadata.training_hyperparameters["max_length"] = str(MAX_MODEL_LENGTH)
-
-    metadata.supported_languages = ["English", "Filipino", "Taglish (Filipino-English)"]
-    metadata.language_support_note = (
-        "Per the study, the model targets English, Filipino, and Taglish "
-        "(Filipino-English code-switched) e-commerce reviews, using a multilingual "
-        "XLM-RoBERTa backbone to capture code-switching, slang, and sarcasm."
-    )
+    hybrid = load_hybrid_metrics()
+    if hybrid:
+        metadata.model_name = hybrid.get("backend", "tfidf_logreg_firecs")
+        eval_block = hybrid.get("eval_with_rating_fusion") or hybrid.get("eval") or {}
+        for key in ("accuracy", "precision", "recall", "f1"):
+            if key in eval_block:
+                metadata.eval_metrics[key] = float(eval_block[key])
+        if "n_samples" in eval_block:
+            metadata.val_rows = int(eval_block["n_samples"])
+        metadata.labeled_rows = metadata.labeled_rows or 10487
+        metadata.train_rows = metadata.train_rows or 7340
+        metadata.class_distribution = {
+            "negative": 2381 + 1027,
+            "neutral": 2549 + 1087,
+            "positive": 2410 + 1033,
+        }
+        hp = hybrid.get("hyperparameters") or {}
+        metadata.training_hyperparameters.update({str(k): str(v) for k, v in hp.items()})
+        metadata.training_hyperparameters["rating_fusion_alpha"] = str(
+            hybrid.get("fusion_alpha", DEFAULT_FUSION_ALPHA)
+        )
     return metadata
 
 
@@ -242,13 +300,22 @@ def resolve_model_source(
         )
 
     for candidate in candidates:
-        config_file = candidate / "config.json"
-        if config_file.exists():
-            return str(candidate), "Using local fine-tuned checkpoint."
+        if is_xlmr_checkpoint(str(candidate)):
+            return str(candidate), "Using local fine-tuned XLM-RoBERTa checkpoint."
+        if is_hybrid_source(str(candidate)):
+            return str(candidate), "Using local hybrid sentiment pipeline."
+
+    for folder in _hybrid_dir_candidates():
+        if is_hybrid_source(str(folder)):
+            return (
+                str(folder),
+                "Using FiReCS hybrid TF-IDF model with Shopee star-rating fusion.",
+            )
 
     return (
         metadata.model_name,
-        "Local fine-tuned checkpoint not found. Falling back to base model weights.",
+        "No local sentiment checkpoint found. Predictions stay disabled until "
+        "`hybrid_model/` or `models/xlmr_sentiment_model/` is present.",
     )
 
 
@@ -258,12 +325,40 @@ def resolve_model_source(
 class SentimentModelService:
     def __init__(self, model_source: str):
         self.model_source = model_source
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_source)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_source)
-        self.model.to(self.device)
-        self.model.eval()
-        self.runtime_id2label = self._extract_runtime_label_map()
+        self.tokenizer = None
+        self.model = None
+        self.pipeline = None
+        self.device = "cpu"
+        self.use_rating_prefix = False
+        self.fuse_ratings = True
+        self.fusion_alpha = DEFAULT_FUSION_ALPHA
+
+        if is_hybrid_source(model_source):
+            import joblib
+
+            self.backend = "hybrid"
+            self.pipeline = joblib.load(Path(model_source) / "pipeline.joblib")
+            self.runtime_id2label = {idx: label for idx, label in ID2LABEL.items()}
+        elif is_xlmr_checkpoint(model_source):
+            import torch
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            self.backend = "xlmr"
+            self.use_rating_prefix = True
+            self.fuse_ratings = False
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_source)
+            self.model = AutoModelForSequenceClassification.from_pretrained(model_source)
+            self.model.to(self.device)
+            self.model.eval()
+            self.runtime_id2label = self._extract_runtime_label_map()
+        else:
+            raise FileNotFoundError(
+                f"No usable sentiment model at {model_source!r}. "
+                "Train `python train_hybrid.py` or place a fine-tuned XLM-R checkpoint "
+                "in models/xlmr_sentiment_model/."
+            )
+
         self.runtime_label2id = {
             label: idx for idx, label in self.runtime_id2label.items()
         }
@@ -322,6 +417,11 @@ class SentimentModelService:
         )
 
     def _forward_probabilities(self, texts: Sequence[str]) -> np.ndarray:
+        cleaned = [clean_review(t) or " " for t in texts]
+        if self.backend == "hybrid":
+            frame = pd.DataFrame({"text": cleaned})
+            return np.asarray(self.pipeline.predict_proba(frame), dtype=float)
+
         encoded = self.tokenizer(
             list(texts),
             truncation=True,
@@ -330,12 +430,14 @@ class SentimentModelService:
             return_tensors="pt",
         )
         encoded = {key: value.to(self.device) for key, value in encoded.items()}
+        import torch
+
         with torch.no_grad():
             logits = self.model(**encoded).logits
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
         return probs
 
-    def predict(self, text: str) -> SentimentPrediction:
+    def predict(self, text: str, rating=None) -> SentimentPrediction:
         if not text or not text.strip():
             raise ValueError("Input text is empty.")
 
@@ -358,7 +460,14 @@ class SentimentModelService:
                 "samples (English/Tagalog). Prediction confidence may be less reliable."
             )
 
-        probs = self._forward_probabilities([clean_text])[0].tolist()
+        if self.use_rating_prefix:
+            model_text = build_model_text(clean_text, rating)
+        else:
+            model_text = clean_review(clean_text) or " "
+        probs = self._forward_probabilities([model_text])[0]
+        if self.fuse_ratings:
+            probs = fuse_with_rating(np.asarray([probs]), [rating], self.fusion_alpha)[0]
+        probs = np.asarray(probs, dtype=float).tolist()
         if not probs:
             raise RuntimeError("Model produced no output probabilities.")
 
@@ -398,14 +507,34 @@ class SentimentModelService:
         )
 
     def predict_labels(
-        self, texts: Sequence[str], batch_size: int = DEFAULT_BATCH_SIZE
+        self,
+        texts: Sequence[str],
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        ratings: Optional[Sequence] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return predicted label ids and full probability matrix for a batch."""
         all_probs: List[np.ndarray] = []
+        rating_list: Sequence = ratings if ratings is not None else [None] * len(texts)
         for start in range(0, len(texts), batch_size):
-            chunk = [str(t) if t is not None else "" for t in texts[start : start + batch_size]]
-            chunk = [t if t.strip() else " " for t in chunk]
-            all_probs.append(self._forward_probabilities(chunk))
+            raw_chunk = [
+                str(t) if t is not None else "" for t in texts[start : start + batch_size]
+            ]
+            rate_chunk = list(rating_list[start : start + batch_size])
+            while len(rate_chunk) < len(raw_chunk):
+                rate_chunk.append(None)
+            if self.use_rating_prefix:
+                chunk = [
+                    build_model_text(t if t.strip() else " ", r)
+                    for t, r in zip(raw_chunk, rate_chunk)
+                ]
+            else:
+                chunk = [clean_review(t) or " " for t in raw_chunk]
+            batch_probs = self._forward_probabilities(chunk)
+            if self.fuse_ratings:
+                batch_probs = fuse_with_rating(
+                    batch_probs, rate_chunk, self.fusion_alpha
+                )
+            all_probs.append(batch_probs)
         if not all_probs:
             return np.array([]), np.zeros((0, len(self.runtime_id2label)))
         prob_matrix = np.vstack(all_probs)
@@ -417,11 +546,18 @@ class SentimentModelService:
         df: pd.DataFrame,
         text_col: str,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        rating_col: Optional[str] = None,
     ) -> pd.DataFrame:
         """Append sentiment_label, sentiment_score, confidence_level to reviews."""
         working = df.copy()
         texts = working[text_col].fillna("").astype(str).tolist()
-        pred_ids, prob_matrix = self.predict_labels(texts, batch_size=batch_size)
+        resolved_rating_col = rating_col or guess_rating_column(working.columns)
+        ratings = (
+            working[resolved_rating_col].tolist() if resolved_rating_col else None
+        )
+        pred_ids, prob_matrix = self.predict_labels(
+            texts, batch_size=batch_size, ratings=ratings
+        )
 
         positive_idx = self._positive_index()
         working["sentiment_label"] = [
@@ -436,8 +572,11 @@ class SentimentModelService:
         texts: Sequence[str],
         true_labels: Sequence,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        ratings: Optional[Sequence] = None,
     ) -> Dict[str, object]:
-        pred_ids, _ = self.predict_labels(texts, batch_size=batch_size)
+        pred_ids, _ = self.predict_labels(
+            texts, batch_size=batch_size, ratings=ratings
+        )
         y_true = np.array([_coerce_label_id(v) for v in true_labels])
         y_pred = np.array([int(v) for v in pred_ids])
 
