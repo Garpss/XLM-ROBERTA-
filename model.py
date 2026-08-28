@@ -43,9 +43,9 @@ class ModelMetadata:
     )
     project_description: str = (
         "A sentiment-aware recommender system for Filipino, English, and Taglish "
-        "(Filipino-English) e-commerce reviews. Fine-tuned XLM-RoBERTa classifies "
-        "review sentiment, then a Bayesian Weighted Score ranks products while "
-        "protecting against low-sample bias."
+        "(Filipino-English) e-commerce reviews. A FiReCS hybrid classifier "
+        "(optional fine-tuned XLM-RoBERTa) scores review sentiment, then a "
+        "Bayesian Weighted Score ranks products while protecting against low-sample bias."
     )
     authors: List[str] = field(
         default_factory=lambda: [
