@@ -96,8 +96,13 @@ thesis/
 ├── app.py                 # Streamlit UI: overview, single review, batch & recommendations, evaluation
 ├── model.py               # Model service + all data logic (inference, aggregation, BWS, ranking, metrics)
 ├── text_format.py         # Shared review cleaning + "Star rating: N out of 5." prefix
-├── pipeline.ipynb         # Colab training notebook (transformers 4.x and 5.x)
+├── pipeline.ipynb         # Colab XLM-R training notebook (transformers 4.x and 5.x)
 ├── pipeline_helpers.py    # TrainingArguments / Trainer kwargs compatible with HF v4 and v5
+├── hybrid_model/          # Committed compact FiReCS classifier + held-out metrics
+│   ├── pipeline.joblib
+│   └── metrics.json
+├── train_hybrid.py        # Retrain the hybrid model from ccosme/FiReCS
+├── rating_fusion.py       # Shopee star-rating prior fused with text probabilities
 ├── requirements.txt       # Pinned dependencies
 ├── README.md              # This file
 ├── .gitignore             # Excludes large models, archives, datasets, caches
@@ -111,7 +116,7 @@ thesis/
         └── sentencepiece.bpe.model
 ```
 
-> `models/`, `*.zip`, and `*.csv` are intentionally **git-ignored** — model weights are large (multiple GB) and datasets/archives are kept out of version control. Host the trained model on Google Drive / Hugging Face and download it locally.
+> `models/` (XLM-R weights), `*.zip`, and `*.csv` are intentionally **git-ignored**. The compact hybrid checkpoint in `hybrid_model/` **is** committed so Streamlit can run without a GPU download.
 
 ### Key modules in `model.py`
 
@@ -129,7 +134,26 @@ thesis/
 
 ---
 
-## Training on Colab
+## Hybrid model (default in Streamlit)
+
+The app ships with a compact **FiReCS hybrid** so predictions work without a 1 GB GPU checkpoint:
+
+1. Word + character TF-IDF logistic regression trained on **10,487** official FiReCS reviews (Taglish Shopee + Google Maps).
+2. **Star-rating fusion** using the empirical P(label | ★) from the 1,000-row Shopee annotation table.
+
+Held-out FiReCS test (3,147 reviews):
+
+| Model | Accuracy | Weighted F1 |
+| --- | --- | --- |
+| Previous Shopee 1k XLM-R | 0.770 | 0.765 |
+| Hybrid text only | 0.816 | 0.817 |
+| Hybrid + star-rating fusion | **0.868** | **0.867** |
+
+Retrain with `python train_hybrid.py` after downloading `ccosme/FiReCS`. A later Colab XLM-R checkpoint in `models/xlmr_sentiment_model/` is still preferred when present.
+
+Open **Model Results** in Streamlit to see the confusion matrix, per-class F1, and live Taglish predictions.
+
+---
 
 Use `pipeline.ipynb` with a **GPU (T4)** runtime. The notebook is written for both Hugging Face transformers **4.x and 5.x**.
 
@@ -186,11 +210,9 @@ pip install -r requirements.txt
 
 ---
 
-## The Fine-Tuned Model (required)
+## The Fine-Tuned Model (optional XLM-R)
 
-The app needs the **fine-tuned** XLM-RoBERTa checkpoint. Without it, the app falls back to the generic `xlm-roberta-base` (which only has 2 generic labels), fails schema validation, and **disables all prediction buttons** on purpose.
-
-Place your trained model here:
+Streamlit loads `hybrid_model/` by default. To use a Colab-fine-tuned **XLM-RoBERTa** checkpoint instead, place it at:
 
 ```
 models/xlmr_sentiment_model/

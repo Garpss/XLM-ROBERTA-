@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 from typing import Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -15,6 +16,7 @@ from model import (
     aggregate_by_product,
     apply_bayesian_score,
     evaluate_ranking,
+    load_hybrid_metrics,
     parse_project_metadata,
     prediction_history_row,
     rank_products,
@@ -115,7 +117,7 @@ def _render_sidebar(
     st.sidebar.markdown(f"**Runtime label map:** `{service.runtime_label_map()}`")
 
     if schema_ok:
-        st.sidebar.success("Fine-tuned sentiment checkpoint loaded.")
+        st.sidebar.success("Sentiment model loaded.")
     else:
         st.sidebar.error("Sentiment checkpoint NOT loaded (see banner).")
 
@@ -274,9 +276,17 @@ def _render_overview(metadata: ModelMetadata) -> None:
         "3. Evaluate sentiment classification into positive, negative, and neutral."
     )
 
+    if metadata.eval_metrics:
+        st.markdown("**Current held-out scores** (see **Model Results** for the full report)")
+        mcols = st.columns(4)
+        mcols[0].metric("Accuracy", f"{metadata.eval_metrics.get('accuracy', 0):.1%}")
+        mcols[1].metric("Weighted F1", f"{metadata.eval_metrics.get('f1', 0):.3f}")
+        mcols[2].metric("Precision", f"{metadata.eval_metrics.get('precision', 0):.3f}")
+        mcols[3].metric("Recall", f"{metadata.eval_metrics.get('recall', 0):.3f}")
+
     st.divider()
     steps = [
-        ("1 · Sentiment (XLM-R)", "Classify each review as positive / negative / neutral, with a 0–1 sentiment score and confidence."),
+        ("1 · Sentiment", "Classify each review as positive / negative / neutral, with a 0–1 sentiment score and confidence."),
         ("2 · Aggregation", "Group reviews by product: total reviews, average sentiment, class counts."),
         ("3 · Bayesian Score", "Weight average sentiment by review volume so high-volume products are trusted more."),
         ("4 · Ranking + RSA baseline", "Sort by Bayesian score for the Top-N, compared against a Raw Sentiment Average baseline."),
@@ -433,17 +443,25 @@ def _build_sample_dataframe() -> pd.DataFrame:
     return pd.DataFrame(
         {
             "product_title": [
-                "Earbuds X", "Earbuds X", "Earbuds A", "Earbuds A", "Earbuds Y",
+                "Earbuds X", "Earbuds X", "Earbuds X",
+                "Earbuds A", "Earbuds A",
+                "Phone Case Y", "Phone Case Y", "Phone Case Y",
+                "Power Bank Z", "Power Bank Z",
             ],
-            "product_category": ["Audio", "Audio", "Audio", "Audio", "Audio"],
+            "product_category": ["Audio"] * 5 + ["Accessories"] * 3 + ["Charging"] * 2,
             "product_review_text": [
                 "Ang ganda ng sound quality, sulit na sulit!",
                 "Great bass and battery life, highly recommend.",
+                "Medyo mahina ang mic pero okay pa rin for the price.",
                 "Okay lang, medyo mahina ang mic.",
                 "Good value for money overall.",
-                "Hindi maganda, madaling masira.",
+                "Hindi maganda, madaling masira. Disappointed.",
+                "Scam to, fake item, di gumana nung dumating.",
+                "Sobrang nipis, scratch agad after one day.",
+                "Super worth it, mabilis mag-charge, recommend ko to.",
+                "Ok naman kaso matagal dumating yung parcel.",
             ],
-            "Rating Star": [5, 5, 3, 4, 1],
+            "Rating Star": [5, 5, 4, 3, 4, 1, 1, 2, 5, 3],
         }
     )
 
@@ -723,6 +741,133 @@ def _render_batch(service: SentimentModelService, schema_ok: bool) -> None:
     )
 
 
+def _render_results(service: SentimentModelService, schema_ok: bool) -> None:
+    st.subheader("Held-out model results")
+    payload = load_hybrid_metrics()
+    if not payload:
+        st.info(
+            "No `hybrid_model/metrics.json` yet. Run `python train_hybrid.py` "
+            "or upload a labeled CSV in the Evaluation tab."
+        )
+        return
+
+    text_eval = payload.get("eval") or {}
+    fused_eval = payload.get("eval_with_rating_fusion") or {}
+    previous = payload.get("previous_xlmr_shopee") or {}
+
+    st.caption(
+        f"{payload.get('dataset', 'FiReCS')} · {payload.get('split', '')}. "
+        f"{payload.get('baseline_note', '')}"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    fused_acc = fused_eval.get("accuracy")
+    fused_f1 = fused_eval.get("f1")
+    text_acc = text_eval.get("accuracy")
+    old_acc = previous.get("accuracy")
+    c1.metric(
+        "Accuracy (text + stars)",
+        f"{fused_acc:.1%}" if fused_acc is not None else "—",
+        delta=(
+            f"{(fused_acc - old_acc):+.1%} vs previous XLM-R"
+            if fused_acc is not None and old_acc
+            else None
+        ),
+    )
+    c2.metric(
+        "Weighted F1 (text + stars)",
+        f"{fused_f1:.3f}" if fused_f1 is not None else "—",
+    )
+    c3.metric(
+        "Accuracy (text only)",
+        f"{text_acc:.1%}" if text_acc is not None else "—",
+    )
+    c4.metric("Test reviews", f"{text_eval.get('n_samples', 0):,}")
+
+    st.markdown("**Comparison**")
+    compare = pd.DataFrame(
+        [
+            {
+                "Model": "Previous Shopee 1k XLM-R (held-out 200)",
+                "Accuracy": previous.get("accuracy"),
+                "Weighted F1": previous.get("f1"),
+            },
+            {
+                "Model": "Hybrid TF-IDF on FiReCS (text only)",
+                "Accuracy": text_eval.get("accuracy"),
+                "Weighted F1": text_eval.get("f1"),
+            },
+            {
+                "Model": "Hybrid + Shopee star-rating fusion",
+                "Accuracy": fused_eval.get("accuracy"),
+                "Weighted F1": fused_eval.get("f1"),
+            },
+        ]
+    )
+    st.dataframe(compare, width="stretch", hide_index=True)
+
+    chart = go.Figure()
+    names = compare["Model"].tolist()
+    accs = [v if v is not None else 0 for v in compare["Accuracy"].tolist()]
+    f1s = [v if v is not None else 0 for v in compare["Weighted F1"].tolist()]
+    chart.add_trace(go.Bar(name="Accuracy", x=names, y=accs, marker_color="#2ECC71"))
+    chart.add_trace(go.Bar(name="Weighted F1", x=names, y=f1s, marker_color="#5DADE2"))
+    chart.update_layout(
+        barmode="group",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(range=[0, 1], title="Score"),
+        height=360,
+        margin=dict(l=20, r=20, t=30, b=80),
+    )
+    st.plotly_chart(chart, width="stretch")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Confusion matrix (text + stars)**")
+        cm = fused_eval.get("confusion_matrix") or text_eval.get("confusion_matrix")
+        labels = fused_eval.get("labels") or text_eval.get("labels") or LABEL_ORDER
+        if cm is not None:
+            st.plotly_chart(_confusion_matrix_chart(np.array(cm), labels), width="stretch")
+    with right:
+        st.markdown("**Per-class F1 (text + stars)**")
+        rows = fused_eval.get("per_class") or text_eval.get("per_class") or []
+        if rows:
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    st.divider()
+    st.markdown("### Live Taglish predictions")
+    st.caption("The same hybrid model running inside this app, with star-rating fusion.")
+    demos = [
+        ("Ang ganda ng sound quality, sulit na sulit!", 5, "positive"),
+        ("Okay lang, medyo mahina ang mic.", 3, "neutral"),
+        ("Hindi maganda, madaling masira. Disappointed.", 1, "negative"),
+        ("Ganda sana kaso delayed yung delivery and may scratch.", 3, "neutral"),
+        ("Super worth it, mabilis mag-charge, recommend ko to.", 5, "positive"),
+        ("Scam to, fake item, di gumana nung dumating.", 1, "negative"),
+    ]
+    if not schema_ok:
+        st.warning("Model is not loaded, so live predictions are disabled.")
+        return
+
+    records = []
+    for text, stars, expected in demos:
+        prediction = service.predict(text, rating=stars)
+        records.append(
+            {
+                "Review": text,
+                "Stars": stars,
+                "Predicted": prediction.label,
+                "Confidence": round(prediction.confidence, 3),
+                "P(neg)": round(prediction.probabilities.get("negative", 0), 3),
+                "P(neu)": round(prediction.probabilities.get("neutral", 0), 3),
+                "P(pos)": round(prediction.probabilities.get("positive", 0), 3),
+            }
+        )
+    st.dataframe(pd.DataFrame(records), width="stretch", hide_index=True)
+
+
 def _render_evaluation(service: SentimentModelService, schema_ok: bool) -> None:
     st.subheader("Model Evaluation")
 
@@ -885,7 +1030,7 @@ def main() -> None:
         st.title("Controls")
         notebook_path = st.text_input(
             "Notebook path",
-            value="C:/Users/cypri/Downloads/pipeline.ipynb",
+            value="pipeline.ipynb",
             help="Project notebook used to extract model/training metadata.",
         )
         model_dir = st.text_input(
@@ -907,17 +1052,19 @@ def main() -> None:
 
     if not schema_ok:
         st.error(
-            "⚠️ The fine-tuned sentiment checkpoint is not loaded, so predictions are "
-            "disabled. Place your trained model at `models/xlmr_sentiment_model` "
-            "(or set the directory in the sidebar), then rerun."
+            "⚠️ No usable sentiment model is loaded, so predictions are disabled. "
+            "Keep `hybrid_model/` in the repo (or train it with `python train_hybrid.py`), "
+            "or place a fine-tuned XLM-RoBERTa checkpoint at `models/xlmr_sentiment_model`."
         )
         st.caption(schema_message)
 
-    tab_overview, tab_single, tab_batch, tab_eval = st.tabs(
-        ["Overview", "Single Review", "Batch & Recommendations", "Evaluation"]
+    tab_overview, tab_results, tab_single, tab_batch, tab_eval = st.tabs(
+        ["Overview", "Model Results", "Single Review", "Batch & Recommendations", "Evaluation"]
     )
     with tab_overview:
         _render_overview(metadata)
+    with tab_results:
+        _render_results(service, schema_ok)
     with tab_batch:
         _render_batch(service, schema_ok)
     with tab_single:
