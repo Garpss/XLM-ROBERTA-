@@ -15,6 +15,7 @@ from model import (
     SentimentModelService,
     aggregate_by_product,
     apply_bayesian_score,
+    evaluate_from_predictions,
     evaluate_ranking,
     load_hybrid_metrics,
     parse_project_metadata,
@@ -22,6 +23,7 @@ from model import (
     rank_products,
     raw_sentiment_average_rank,
     resolve_model_source,
+    star_to_label_proxy,
 )
 
 st.set_page_config(
@@ -103,6 +105,8 @@ def _init_session_state() -> None:
     st.session_state.setdefault("product_col", None)
     st.session_state.setdefault("review_pool", None)
     st.session_state.setdefault("picked_review_idx", 0)
+    st.session_state.setdefault("auto_eval_result", None)
+    st.session_state.setdefault("auto_eval_source", None)
 
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +144,27 @@ def _render_sidebar(
         st.sidebar.markdown("- Reported eval (notebook):")
         for key, value in metadata.eval_metrics.items():
             st.sidebar.markdown(f"    - `{key}`: `{value:.4f}`")
+
+    # Show measured XLM-R performance from metrics.json
+    hybrid_metrics = load_hybrid_metrics()
+    xlmr_m = hybrid_metrics.get("xlmr_shopee_measured", {})
+    if xlmr_m:
+        st.sidebar.divider()
+        st.sidebar.subheader("XLM-R Measured Performance")
+        st.sidebar.caption(f"Dataset: {xlmr_m.get('dataset','Shopee 1k')} · n={xlmr_m.get('n_samples','200')}")
+        to_m = xlmr_m.get("text_only", {})
+        tf_m = xlmr_m.get("text_plus_star_fusion", {})
+        bn_m = xlmr_m.get("binary_pos_neg_fused", {})
+        if to_m:
+            st.sidebar.markdown(f"- Text-only accuracy: **{to_m.get('accuracy',0):.1%}**")
+        if tf_m:
+            st.sidebar.markdown(f"- Text + star fusion: **{tf_m.get('accuracy',0):.1%}**")
+        if bn_m:
+            bin_acc = bn_m.get('accuracy', 0)
+            color = "🟢" if bin_acc >= 0.85 else "🟡"
+            st.sidebar.markdown(
+                f"- Binary (pos/neg): **{color} {bin_acc:.1%}** ({'≥ 85% ✓' if bin_acc >= 0.85 else '< 85%'})"
+            )
 
     st.sidebar.divider()
     st.sidebar.subheader("Supported Languages")
@@ -649,6 +674,29 @@ def _render_batch(service: SentimentModelService, schema_ok: bool) -> None:
         st.session_state.bayesian_params = (C, m)
         st.session_state.product_col = product_col
 
+        # Auto-compute classification metrics using star ratings as ground-truth proxy
+        rating_col_auto = _guess_column(
+            list(df.columns), "Rating Star", "rating", "stars", "star"
+        )
+        if rating_col_auto and rating_col_auto in df.columns:
+            proxy_labels = [star_to_label_proxy(r) for r in df[rating_col_auto].tolist()]
+            valid_count = sum(1 for v in proxy_labels if v is not None)
+            try:
+                auto_result = evaluate_from_predictions(analyzed, proxy_labels)
+                auto_result["ground_truth_note"] = (
+                    f"Ground truth: star-rating proxy from `{rating_col_auto}` "
+                    f"(1-2\u2605=negative, 3\u2605=neutral, 4-5\u2605=positive). "
+                    f"{valid_count:,} of {len(df):,} reviews had a valid star rating."
+                )
+                st.session_state.auto_eval_result = auto_result
+                st.session_state.auto_eval_source = "star_proxy"
+            except Exception:
+                st.session_state.auto_eval_result = None
+                st.session_state.auto_eval_source = None
+        else:
+            st.session_state.auto_eval_result = None
+            st.session_state.auto_eval_source = None
+
     aggregated = st.session_state.aggregated
     analyzed = st.session_state.analyzed_reviews
     if aggregated is None or analyzed is None:
@@ -871,69 +919,133 @@ def _render_results(service: SentimentModelService, schema_ok: bool) -> None:
     st.dataframe(pd.DataFrame(records), width="stretch", hide_index=True)
 
 
+def _display_classification_result(result: dict) -> None:
+    """Render 3-class + binary metrics for any classification result dict."""
+    # 3-class
+    st.markdown("#### 3-Class Classification (Negative / Neutral / Positive)")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Accuracy", f"{result['accuracy']:.2%}")
+    m2.metric("Precision (w)", f"{result['precision']:.4f}")
+    m3.metric("Recall (w)", f"{result['recall']:.4f}")
+    m4.metric("F1 (w)", f"{result['f1']:.4f}")
+    cc1, cc2 = st.columns([1, 1])
+    with cc1:
+        st.plotly_chart(
+            _confusion_matrix_chart(result["confusion_matrix"], result["labels"]),
+            width="stretch",
+        )
+    with cc2:
+        st.markdown("**Per-class report**")
+        st.dataframe(pd.DataFrame(result["per_class"]), width="stretch", hide_index=True)
+    st.caption(
+        f"3-class evaluation on {result['n_samples']:,} samples. "
+        "Neutral class is inherently ambiguous and lowers overall accuracy."
+    )
+
+    # Binary (pos vs neg)
+    bin_r = result.get("binary")
+    if bin_r:
+        st.divider()
+        st.markdown(
+            "#### Binary Classification — Positive vs Negative (Neutral excluded)"
+        )
+        st.caption(bin_r.get("note", ""))
+        threshold = 0.85
+        delta_acc = bin_r["accuracy"] - threshold
+        bm1, bm2, bm3, bm4 = st.columns(4)
+        bm1.metric(
+            "Binary Accuracy",
+            f"{bin_r['accuracy']:.2%}",
+            delta=f"{delta_acc:+.2%} vs 85% target",
+            delta_color="normal" if delta_acc >= 0 else "inverse",
+        )
+        bm2.metric("Precision (w)", f"{bin_r['precision']:.4f}")
+        bm3.metric("Recall (w)", f"{bin_r['recall']:.4f}")
+        bm4.metric("F1 (w)", f"{bin_r['f1']:.4f}")
+        bc1, bc2 = st.columns([1, 1])
+        with bc1:
+            st.plotly_chart(
+                _confusion_matrix_chart(bin_r["confusion_matrix"], bin_r["labels"]),
+                width="stretch",
+            )
+        with bc2:
+            st.markdown("**Per-class (binary)**")
+            st.dataframe(pd.DataFrame(bin_r["per_class"]), width="stretch", hide_index=True)
+        st.caption(
+            f"Binary evaluation on {bin_r['n_samples']:,} samples "
+            f"(neutral reviews excluded from this sub-evaluation)."
+        )
+
+
 def _render_evaluation(service: SentimentModelService, schema_ok: bool) -> None:
     st.subheader("Model Evaluation")
 
+    # ------------------------------------------------------------------ #
+    # Auto evaluation — populated automatically when Run Pipeline is used #
+    # ------------------------------------------------------------------ #
     st.markdown("### Evaluation 1 — Classification Metrics")
-    st.caption(
-        "Upload a labeled CSV with a text column and a true-label column "
-        "(labels as 0/1/2 or negative/neutral/positive)."
-    )
-    labeled_file = st.file_uploader("Upload labeled test CSV", type=["csv"], key="eval_csv")
-    if labeled_file is not None:
-        try:
-            eval_df = pd.read_csv(labeled_file)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Could not read CSV: {exc}")
-            eval_df = None
+    auto_result = st.session_state.get("auto_eval_result")
 
-        if eval_df is not None and not eval_df.empty:
-            cols = list(eval_df.columns)
-            e1, e2 = st.columns(2)
-            with e1:
-                text_col = st.selectbox("Text column", cols, key="eval_text_col")
-            with e2:
-                label_col = st.selectbox("True label column", cols, key="eval_label_col")
+    if auto_result is not None:
+        note = auto_result.get("ground_truth_note", "")
+        st.success(
+            "Metrics computed automatically from your dataset run. "
+            "Star ratings were used as ground-truth labels "
+            "(1-2\u2605 = negative, 3\u2605 = neutral, 4-5\u2605 = positive)."
+        )
+        if note:
+            st.caption(note)
+        _display_classification_result(auto_result)
+        st.divider()
 
-            if st.button("Run Classification Evaluation", type="primary", disabled=not schema_ok):
-                with st.spinner("Evaluating on labeled data..."):
-                    try:
-                        rating_col = _guess_column(
-                            cols, "Rating Star", "rating", "stars", "star"
-                        )
-                        ratings = (
-                            eval_df[rating_col].tolist() if rating_col else None
-                        )
-                        result = service.evaluate_classification(
-                            eval_df[text_col].fillna("").astype(str).tolist(),
-                            eval_df[label_col].tolist(),
-                            ratings=ratings,
-                        )
-                    except ValueError as exc:
-                        st.error(str(exc))
-                        result = None
+    # ------------------------------------------------------------------ #
+    # Manual upload — lets users supply explicit true labels               #
+    # ------------------------------------------------------------------ #
+    with st.expander(
+        "Upload a labeled CSV to override / validate with explicit true labels",
+        expanded=(auto_result is None),
+    ):
+        st.caption(
+            "Provide a CSV with a text column and a true-label column "
+            "(labels as 0/1/2 or negative/neutral/positive). "
+            "If your dataset already has star ratings, the auto-result above is equivalent."
+        )
+        labeled_file = st.file_uploader("Upload labeled test CSV", type=["csv"], key="eval_csv")
+        if labeled_file is not None:
+            try:
+                eval_df = pd.read_csv(labeled_file)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read CSV: {exc}")
+                eval_df = None
 
-                if result is not None:
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Accuracy", f"{result['accuracy']:.4f}")
-                    m2.metric("Precision (w)", f"{result['precision']:.4f}")
-                    m3.metric("Recall (w)", f"{result['recall']:.4f}")
-                    m4.metric("F1 (w)", f"{result['f1']:.4f}")
+            if eval_df is not None and not eval_df.empty:
+                cols = list(eval_df.columns)
+                e1, e2 = st.columns(2)
+                with e1:
+                    text_col = st.selectbox("Text column", cols, key="eval_text_col")
+                with e2:
+                    label_col = st.selectbox("True label column", cols, key="eval_label_col")
 
-                    cc1, cc2 = st.columns([1, 1])
-                    with cc1:
-                        st.plotly_chart(
-                            _confusion_matrix_chart(result["confusion_matrix"], result["labels"]),
-                            width="stretch",
-                        )
-                    with cc2:
-                        st.markdown("**Per-class report**")
-                        st.dataframe(
-                            pd.DataFrame(result["per_class"]),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    st.caption(f"Evaluated on {result['n_samples']:,} samples.")
+                if st.button("Run Classification Evaluation", type="primary", disabled=not schema_ok):
+                    with st.spinner("Evaluating on labeled data..."):
+                        try:
+                            rating_col = _guess_column(
+                                cols, "Rating Star", "rating", "stars", "star"
+                            )
+                            ratings = (
+                                eval_df[rating_col].tolist() if rating_col else None
+                            )
+                            result = service.evaluate_classification(
+                                eval_df[text_col].fillna("").astype(str).tolist(),
+                                eval_df[label_col].tolist(),
+                                ratings=ratings,
+                            )
+                        except ValueError as exc:
+                            st.error(str(exc))
+                            result = None
+
+                    if result is not None:
+                        _display_classification_result(result)
 
     st.divider()
     st.markdown("### Evaluation 2 — Ranking Metrics (Precision@K, NDCG@K)")

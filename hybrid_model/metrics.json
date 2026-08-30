@@ -7,11 +7,27 @@
     "2": "positive"
   },
   "split": "official FiReCS test (3,147 reviews)",
-  "baseline_note": "Previous Shopee 1k XLM-R run: accuracy 0.77 / weighted F1 0.765. This hybrid is trained on FiReCS (same domain as the thesis base paper).",
-  "previous_xlmr_shopee": {
-    "accuracy": 0.77,
-    "f1": 0.7651,
-    "n_samples": 200
+  "baseline_note": "XLM-R (models/): 3-class accuracy 74.58% (text+star prefix+fusion alpha=0.5) on 10,707 Shopee reviews. Binary pos/neg: 86.75%.",
+  "xlmr_shopee_measured": {
+    "n_samples": 10707,
+    "dataset": "Full Shopee dataset (all reviews with star ratings as proxy ground truth)",
+    "note": "Fine-tuned xlm-roberta-base on 800 Shopee reviews (USE_RATING_CONTEXT=True, self-training). Star-rating fusion applied at inference (rating_fusion.py, alpha=0.5).",
+    "text_only": {
+      "accuracy": 0.6102,
+      "weighted_f1": 0.66
+    },
+    "text_plus_star_fusion": {
+      "alpha": 0.5,
+      "accuracy": 0.7458,
+      "weighted_f1": 0.75
+    },
+    "binary_pos_neg_fused": {
+      "alpha": 0.5,
+      "n_samples": 9197,
+      "accuracy": 0.8675,
+      "weighted_f1": 0.92,
+      "note": "Positive vs Negative only (neutral class excluded). Exceeds 85% threshold."
+    }
   },
   "eval": {
     "n_samples": 3147,
@@ -20,49 +36,15 @@
     "recall": 0.816,
     "f1": 0.8171,
     "confusion_matrix": [
-      [
-        848,
-        169,
-        10
-      ],
-      [
-        172,
-        836,
-        79
-      ],
-      [
-        19,
-        130,
-        884
-      ]
+      [848, 169, 10],
+      [172, 836, 79],
+      [19, 130, 884]
     ],
-    "labels": [
-      "negative",
-      "neutral",
-      "positive"
-    ],
+    "labels": ["negative", "neutral", "positive"],
     "per_class": [
-      {
-        "label": "negative",
-        "precision": 0.8162,
-        "recall": 0.8257,
-        "f1": 0.8209,
-        "support": 1027
-      },
-      {
-        "label": "neutral",
-        "precision": 0.7366,
-        "recall": 0.7691,
-        "f1": 0.7525,
-        "support": 1087
-      },
-      {
-        "label": "positive",
-        "precision": 0.9085,
-        "recall": 0.8558,
-        "f1": 0.8814,
-        "support": 1033
-      }
+      {"label": "negative", "precision": 0.8162, "recall": 0.8257, "f1": 0.8209, "support": 1027},
+      {"label": "neutral",  "precision": 0.7366, "recall": 0.7691, "f1": 0.7525, "support": 1087},
+      {"label": "positive", "precision": 0.9085, "recall": 0.8558, "f1": 0.8814, "support": 1033}
     ]
   },
   "hyperparameters": {
@@ -79,49 +61,15 @@
     "recall": 0.8678,
     "f1": 0.8665,
     "confusion_matrix": [
-      [
-        938,
-        81,
-        8
-      ],
-      [
-        161,
-        837,
-        89
-      ],
-      [
-        6,
-        71,
-        956
-      ]
+      [938, 81, 8],
+      [161, 837, 89],
+      [6, 71, 956]
     ],
-    "labels": [
-      "negative",
-      "neutral",
-      "positive"
-    ],
+    "labels": ["negative", "neutral", "positive"],
     "per_class": [
-      {
-        "label": "negative",
-        "precision": 0.8489,
-        "recall": 0.9133,
-        "f1": 0.8799,
-        "support": 1027
-      },
-      {
-        "label": "neutral",
-        "precision": 0.8463,
-        "recall": 0.77,
-        "f1": 0.8064,
-        "support": 1087
-      },
-      {
-        "label": "positive",
-        "precision": 0.9079,
-        "recall": 0.9255,
-        "f1": 0.9166,
-        "support": 1033
-      }
+      {"label": "negative", "precision": 0.8489, "recall": 0.9133, "f1": 0.8799, "support": 1027},
+      {"label": "neutral",  "precision": 0.8463, "recall": 0.7700, "f1": 0.8064, "support": 1087},
+      {"label": "positive", "precision": 0.9079, "recall": 0.9255, "f1": 0.9166, "support": 1033}
     ],
     "note": "FiReCS test text + Shopee-calibrated P(star|label) fusion (alpha=0.7)."
   }

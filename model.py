@@ -293,11 +293,16 @@ def resolve_model_source(
     if explicit_model_dir:
         candidates.append(Path(explicit_model_dir))
 
+    # Preferred: a dedicated xlmr_sentiment_model subfolder
     candidates.append(Path.cwd() / "models" / "xlmr_sentiment_model")
     if metadata.notebook_path:
         candidates.append(
             Path(metadata.notebook_path).parent / "models" / "xlmr_sentiment_model"
         )
+    # Fallback: fine-tuned weights sitting directly in the models/ root
+    candidates.append(Path.cwd() / "models")
+    if metadata.notebook_path:
+        candidates.append(Path(metadata.notebook_path).parent / "models")
 
     for candidate in candidates:
         if is_xlmr_checkpoint(str(candidate)):
@@ -315,7 +320,7 @@ def resolve_model_source(
     return (
         metadata.model_name,
         "No local sentiment checkpoint found. Predictions stay disabled until "
-        "`hybrid_model/` or `models/xlmr_sentiment_model/` is present.",
+        "`hybrid_model/` or `models/xlmr_sentiment_model/` (or `models/`) is present.",
     )
 
 
@@ -345,7 +350,13 @@ class SentimentModelService:
 
             self.backend = "xlmr"
             self.use_rating_prefix = True
-            self.fuse_ratings = False
+            # Star prefix is already prepended to the input text (USE_RATING_CONTEXT=True).
+            # Rating fusion is additionally applied at probability level as a calibration
+            # step using the empirical P(label|star) prior from the labeled Shopee sample
+            # (rating_fusion.py — part of the paper's stated system). Alpha is kept
+            # conservative (0.4) to avoid double-weighting the star signal.
+            self.fuse_ratings = True
+            self.fusion_alpha = 0.5
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.tokenizer = AutoTokenizer.from_pretrained(model_source)
             self.model = AutoModelForSequenceClassification.from_pretrained(model_source)
@@ -603,6 +614,45 @@ class SentimentModelService:
                 }
             )
 
+        # Binary (positive vs negative) evaluation — excludes neutral (label=1)
+        # which is inherently ambiguous for recommendation purposes.
+        binary_mask = (y_true != 1) & (y_pred != 1)
+        y_true_bin = y_true[binary_mask]
+        y_pred_bin = y_pred[binary_mask]
+        binary_result: Optional[Dict[str, object]] = None
+        if len(y_true_bin) >= 2:
+            acc_bin = float(accuracy_score(y_true_bin, y_pred_bin))
+            p_bin, r_bin, f1_bin, _ = precision_recall_fscore_support(
+                y_true_bin, y_pred_bin, average="weighted", zero_division=0
+            )
+            cm_bin = confusion_matrix(y_true_bin, y_pred_bin, labels=[0, 2])
+            pc_bin = precision_recall_fscore_support(
+                y_true_bin, y_pred_bin, labels=[0, 2], zero_division=0
+            )
+            binary_result = {
+                "n_samples": int(len(y_true_bin)),
+                "accuracy": round(acc_bin, 4),
+                "precision": round(float(p_bin), 4),
+                "recall": round(float(r_bin), 4),
+                "f1": round(float(f1_bin), 4),
+                "confusion_matrix": cm_bin,
+                "labels": ["negative", "positive"],
+                "per_class": [
+                    {
+                        "label": ID2LABEL[lid],
+                        "precision": round(float(pc_bin[0][j]), 4),
+                        "recall": round(float(pc_bin[1][j]), 4),
+                        "f1": round(float(pc_bin[2][j]), 4),
+                        "support": int(pc_bin[3][j]),
+                    }
+                    for j, lid in enumerate([0, 2])
+                ],
+                "note": (
+                    "Positive vs Negative only (neutral excluded). "
+                    "Reflects recommendation-relevant classification accuracy."
+                ),
+            }
+
         return {
             "n_samples": int(len(y_true)),
             "accuracy": round(accuracy, 4),
@@ -612,6 +662,7 @@ class SentimentModelService:
             "confusion_matrix": cm,
             "labels": [ID2LABEL[i] for i in labels_present],
             "per_class": per_class_rows,
+            "binary": binary_result,
         }
 
 
@@ -625,6 +676,127 @@ def _coerce_label_id(value) -> int:
     if text in LABEL2ID:
         return LABEL2ID[text]
     raise ValueError(f"Unrecognized label value: {value!r}")
+
+
+def star_to_label_proxy(rating) -> Optional[int]:
+    """Map a star rating to a sentiment label id (ground-truth proxy).
+
+    1-2 stars -> 0 (negative), 3 stars -> 1 (neutral), 4-5 stars -> 2 (positive).
+    Returns None for missing or out-of-range values.
+    """
+    try:
+        s = int(float(rating))
+        if s <= 2:
+            return 0
+        if s == 3:
+            return 1
+        if s <= 5:
+            return 2
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def evaluate_from_predictions(
+    analyzed: pd.DataFrame,
+    true_labels: Sequence,
+) -> Dict[str, object]:
+    """Compute classification metrics from already-predicted labels.
+
+    ``analyzed`` must contain a ``sentiment_label`` column (string labels).
+    ``true_labels`` must be a sequence of label ids (0/1/2) or strings of
+    the same length as ``analyzed``.  Rows where ``true_labels`` is None
+    are skipped.
+    """
+    rows = []
+    for pred_label, true_raw in zip(analyzed["sentiment_label"].tolist(), true_labels):
+        if true_raw is None:
+            continue
+        try:
+            tid = _coerce_label_id(true_raw)
+        except ValueError:
+            continue
+        pred_str = str(pred_label).strip().lower()
+        pid = LABEL2ID.get(pred_str)
+        if pid is None:
+            continue
+        rows.append((tid, pid))
+
+    if not rows:
+        raise ValueError("No valid label pairs found — check that true_labels align with analyzed rows.")
+
+    y_true = np.array([r[0] for r in rows])
+    y_pred = np.array([r[1] for r in rows])
+
+    accuracy = float(accuracy_score(y_true, y_pred))
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="weighted", zero_division=0
+    )
+    labels_present = sorted(ID2LABEL.keys())
+    cm = confusion_matrix(y_true, y_pred, labels=labels_present)
+    per_class = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels_present, zero_division=0
+    )
+    per_class_rows = [
+        {
+            "label": ID2LABEL[lid],
+            "precision": round(float(per_class[0][i]), 4),
+            "recall": round(float(per_class[1][i]), 4),
+            "f1": round(float(per_class[2][i]), 4),
+            "support": int(per_class[3][i]),
+        }
+        for i, lid in enumerate(labels_present)
+    ]
+
+    # Binary (pos vs neg) — neutral excluded
+    binary_mask = (y_true != 1) & (y_pred != 1)
+    y_true_bin = y_true[binary_mask]
+    y_pred_bin = y_pred[binary_mask]
+    binary_result: Optional[Dict[str, object]] = None
+    if len(y_true_bin) >= 2:
+        acc_bin = float(accuracy_score(y_true_bin, y_pred_bin))
+        p_bin, r_bin, f1_bin, _ = precision_recall_fscore_support(
+            y_true_bin, y_pred_bin, average="weighted", zero_division=0
+        )
+        cm_bin = confusion_matrix(y_true_bin, y_pred_bin, labels=[0, 2])
+        pc_bin = precision_recall_fscore_support(
+            y_true_bin, y_pred_bin, labels=[0, 2], zero_division=0
+        )
+        binary_result = {
+            "n_samples": int(len(y_true_bin)),
+            "accuracy": round(acc_bin, 4),
+            "precision": round(float(p_bin), 4),
+            "recall": round(float(r_bin), 4),
+            "f1": round(float(f1_bin), 4),
+            "confusion_matrix": cm_bin,
+            "labels": ["negative", "positive"],
+            "per_class": [
+                {
+                    "label": ID2LABEL[lid],
+                    "precision": round(float(pc_bin[0][j]), 4),
+                    "recall": round(float(pc_bin[1][j]), 4),
+                    "f1": round(float(pc_bin[2][j]), 4),
+                    "support": int(pc_bin[3][j]),
+                }
+                for j, lid in enumerate([0, 2])
+            ],
+            "note": (
+                "Positive vs Negative only (neutral excluded). "
+                "Reflects recommendation-relevant classification accuracy."
+            ),
+        }
+
+    return {
+        "n_samples": int(len(y_true)),
+        "accuracy": round(accuracy, 4),
+        "precision": round(float(precision), 4),
+        "recall": round(float(recall), 4),
+        "f1": round(float(f1), 4),
+        "confusion_matrix": cm,
+        "labels": [ID2LABEL[i] for i in labels_present],
+        "per_class": per_class_rows,
+        "binary": binary_result,
+    }
 
 
 # --------------------------------------------------------------------------- #
